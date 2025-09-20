@@ -18,9 +18,23 @@ class GroupedKANLayer(nn.Module):
         self.grid_size = grid_size
         self.spline_order = spline_order
         
-        # Ensure input_dim is divisible by num_groups
-        assert input_dim % num_groups == 0, f"input_dim {input_dim} must be divisible by num_groups {num_groups}"
+        # Ensure input_dim and output_dim are divisible by num_groups
+        if input_dim % num_groups != 0:
+            num_groups = min(num_groups, input_dim)
+            # Find the largest divisor of input_dim that's <= num_groups
+            for i in range(num_groups, 0, -1):
+                if input_dim % i == 0:
+                    num_groups = i
+                    break
         
+        if output_dim % num_groups != 0:
+            # Adjust num_groups to be compatible with output_dim too
+            for i in range(num_groups, 0, -1):
+                if input_dim % i == 0 and output_dim % i == 0:
+                    num_groups = i
+                    break
+        
+        self.num_groups = num_groups
         self.group_size = input_dim // num_groups
         
         # Create B-spline basis functions for each group
@@ -28,8 +42,9 @@ class GroupedKANLayer(nn.Module):
         
         # Learnable coefficients for B-spline basis functions
         # Shape: (num_groups, group_size, output_dim // num_groups, grid_size)
+        output_per_group = output_dim // num_groups
         self.coefficients = nn.Parameter(
-            torch.randn(num_groups, self.group_size, output_dim // num_groups, grid_size) * 0.1
+            torch.randn(num_groups, self.group_size, output_per_group, grid_size) * 0.1
         )
         
         # Learnable scaling and shifting parameters
@@ -70,20 +85,27 @@ class GroupedKANLayer(nn.Module):
         
         # Compute B-spline basis functions
         basis_outputs = []
+        output_per_group = self.output_dim // self.num_groups
+        
         for g in range(self.num_groups):
             group_output = []
             for i in range(self.group_size):
                 # Get basis functions for this input
                 basis = self.b_spline_basis(x_grouped[:, g, i], self.grid, self.spline_order)
+                # basis shape: (batch_size, grid_size)
                 
-                # Apply learnable coefficients
-                output = torch.einsum('bg,go->bo', basis, self.coefficients[g, i])
+                # Get coefficients for this group and input
+                coeff = self.coefficients[g, i]  # shape: (output_per_group, grid_size)
+                
+                # Apply learnable coefficients: (batch, grid) @ (grid, output_per_group) -> (batch, output_per_group)
+                output = torch.matmul(basis, coeff.T)
                 group_output.append(output)
             
-            # Combine outputs within group
-            group_output = torch.stack(group_output, dim=1)  # (batch, group_size, output_per_group)
-            group_output = group_output.sum(dim=1)  # Sum over group inputs
-            basis_outputs.append(group_output)
+            # Combine outputs within group: sum over group inputs
+            if group_output:
+                group_output = torch.stack(group_output, dim=1)  # (batch, group_size, output_per_group)
+                group_output = group_output.sum(dim=1)  # (batch, output_per_group)
+                basis_outputs.append(group_output)
         
         # Concatenate group outputs
         kan_output = torch.cat(basis_outputs, dim=1)
@@ -114,12 +136,14 @@ class CART_KAN(nn.Module):
                 (n_trees, 1, n_selected), requires_grad=True))
             
             # Replace linear layers with GroupedKAN layers
+            # Ensure kan_groups works with n_selected
+            effective_groups = min(kan_groups, n_selected)
             self.kan_layer1 = nn.ModuleList([
-                GroupedKANLayer(n_selected, n_selected, num_groups=min(kan_groups, n_selected))
+                GroupedKANLayer(n_selected, n_selected, num_groups=effective_groups)
                 for _ in range(n_trees)
             ])
             self.kan_layer2 = nn.ModuleList([
-                GroupedKANLayer(n_selected, n_out, num_groups=min(kan_groups, n_selected))
+                GroupedKANLayer(n_selected, n_out, num_groups=min(effective_groups, n_selected, n_out))
                 for _ in range(n_trees)
             ])
             
@@ -132,12 +156,14 @@ class CART_KAN(nn.Module):
                 (n_trees, 1, n_features), requires_grad=True))
             
             # Replace linear layers with GroupedKAN layers
+            # Ensure kan_groups works with n_features
+            effective_groups = min(kan_groups, n_features)
             self.kan_layer1 = nn.ModuleList([
-                GroupedKANLayer(n_features, n_features, num_groups=min(kan_groups, n_features))
+                GroupedKANLayer(n_features, n_features, num_groups=effective_groups)
                 for _ in range(n_trees)
             ])
             self.kan_layer2 = nn.ModuleList([
-                GroupedKANLayer(n_features, n_out, num_groups=min(kan_groups, n_features))
+                GroupedKANLayer(n_features, n_out, num_groups=min(effective_groups, n_features, n_out))
                 for _ in range(n_trees)
             ])
             

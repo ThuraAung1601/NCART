@@ -76,6 +76,20 @@ class GroupedKANLayer(nn.Module):
     def forward(self, x):
         batch_size = x.shape[0]
         
+        # Debug: Print tensor shapes
+        print(f"Input x shape: {x.shape}")
+        print(f"Expected reshape: ({batch_size}, {self.num_groups}, {self.group_size})")
+        print(f"Product check: {batch_size * self.num_groups * self.group_size} vs {x.numel()}")
+        
+        # Check if reshaping is possible
+        expected_elements = self.num_groups * self.group_size
+        if x.shape[1] != expected_elements:
+            # If input dimension doesn't match expected, we need to handle this
+            # Option 1: Use linear projection to match expected size
+            if not hasattr(self, 'input_projection'):
+                self.input_projection = nn.Linear(x.shape[1], expected_elements).to(x.device)
+            x = self.input_projection(x)
+        
         # Reshape input for group processing
         x_grouped = x.view(batch_size, self.num_groups, self.group_size)
         
@@ -111,7 +125,15 @@ class GroupedKANLayer(nn.Module):
         kan_output = torch.cat(basis_outputs, dim=1)
         
         # Add residual connection with base linear transformation
-        base_output = torch.matmul(x, self.base_weight)
+        # Use original input x for base transformation
+        original_x = x.view(batch_size, -1)  # Flatten to ensure correct shape
+        if original_x.shape[1] != self.input_dim:
+            # Handle dimension mismatch for base weight
+            if not hasattr(self, 'base_projection'):
+                self.base_projection = nn.Linear(original_x.shape[1], self.input_dim).to(x.device)
+            original_x = self.base_projection(original_x)
+        
+        base_output = torch.matmul(original_x, self.base_weight)
         
         return kan_output + 0.1 * base_output  # Small residual connection
 
@@ -138,12 +160,22 @@ class CART_KAN(nn.Module):
             # Replace linear layers with GroupedKAN layers
             # Ensure kan_groups works with n_selected
             effective_groups = min(kan_groups, n_selected)
+            # Make sure effective_groups divides n_selected
+            while n_selected % effective_groups != 0 and effective_groups > 1:
+                effective_groups -= 1
+            
             self.kan_layer1 = nn.ModuleList([
                 GroupedKANLayer(n_selected, n_selected, num_groups=effective_groups)
                 for _ in range(n_trees)
             ])
+            
+            # For second layer, ensure compatibility between n_selected and n_out
+            effective_groups_2 = effective_groups
+            while (n_selected % effective_groups_2 != 0 or n_out % effective_groups_2 != 0) and effective_groups_2 > 1:
+                effective_groups_2 -= 1
+            
             self.kan_layer2 = nn.ModuleList([
-                GroupedKANLayer(n_selected, n_out, num_groups=min(effective_groups, n_selected, n_out))
+                GroupedKANLayer(n_selected, n_out, num_groups=effective_groups_2)
                 for _ in range(n_trees)
             ])
             
@@ -158,21 +190,30 @@ class CART_KAN(nn.Module):
             # Replace linear layers with GroupedKAN layers
             # Ensure kan_groups works with n_features
             effective_groups = min(kan_groups, n_features)
+            while n_features % effective_groups != 0 and effective_groups > 1:
+                effective_groups -= 1
+                
             self.kan_layer1 = nn.ModuleList([
                 GroupedKANLayer(n_features, n_features, num_groups=effective_groups)
                 for _ in range(n_trees)
             ])
+            
+            # For second layer, ensure compatibility between n_features and n_out
+            effective_groups_2 = effective_groups
+            while (n_features % effective_groups_2 != 0 or n_out % effective_groups_2 != 0) and effective_groups_2 > 1:
+                effective_groups_2 -= 1
+                
             self.kan_layer2 = nn.ModuleList([
-                GroupedKANLayer(n_features, n_out, num_groups=min(effective_groups, n_features, n_out))
+                GroupedKANLayer(n_features, n_out, num_groups=effective_groups_2)
                 for _ in range(n_trees)
             ])
             
             self.tree_weight = nn.Parameter(torch.randn(
                 (n_trees, 1, n_out), requires_grad=True))
-            
 
     def forward(self, x):
         # N:number of trees, B:batch size, D:dim of features, S:dim of selected features
+        print(f"CART_KAN input shape: {x.shape}")
 
         x = self.bn(x)  # (B, D) -> (B, D)
 
@@ -188,26 +229,35 @@ class CART_KAN(nn.Module):
             else:
                 raise NotImplementedError("Method not yet implemented")
 
+        print(f"After projection x shape: {x.shape}")
+        
         diff = x-self.cut_points
         score = torch.sigmoid(diff)
+        print(f"Score shape: {score.shape}")
 
         # Process each tree separately with KAN layers
         tree_outputs = []
         for tree_idx in range(self.n_trees):
             # First KAN layer
             tree_input = score[tree_idx]  # (B, D) or (B, S)
+            print(f"Tree {tree_idx} input shape: {tree_input.shape}")
+            
             o1 = F.relu(self.kan_layer1[tree_idx](tree_input))
+            print(f"Tree {tree_idx} after first KAN shape: {o1.shape}")
             
             # Second KAN layer
             o2 = self.kan_layer2[tree_idx](o1)
+            print(f"Tree {tree_idx} after second KAN shape: {o2.shape}")
             
             tree_outputs.append(o2.unsqueeze(0))  # Add tree dimension
         
         # Stack all tree outputs: (N, B, O)
         o2 = torch.cat(tree_outputs, dim=0)
+        print(f"All trees output shape: {o2.shape}")
 
         # merge all trees, (N, B, O)*(N, 1, O) -> (B, O)
         o3 = (o2*self.tree_weight).mean(0)
+        print(f"Final output shape: {o3.shape}")
         return o3
     
     def get_index(self, x):  
@@ -276,10 +326,15 @@ class NCART_KAN(nn.Module):
                                    kan_groups)
 
     def forward(self, x):
+        print(f"NCART_KAN input shape: {x.shape}")
         if self.n_layers > 1:
-            for m in self.model_list:
+            for i, m in enumerate(self.model_list):
+                print(f"Processing layer {i}")
                 x = F.relu(m(x) + x)
+                print(f"After layer {i} shape: {x.shape}")
+        print("Processing final layer")
         out = self.last_layer(x)
+        print(f"Final NCART_KAN output shape: {out.shape}")
         return out
     
     def feature_importance(self, x):
@@ -292,7 +347,7 @@ class NCART_KAN(nn.Module):
     
     def normalize(self, x):
         return x/np.sum(x)
-
+        
 class NCARTClassifier_KAN():
 
     def __init__(self, 
